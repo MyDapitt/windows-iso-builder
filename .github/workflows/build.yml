@@ -2,6 +2,13 @@ name: Build Windows ISO (Windows Runner) and Upload Metadata
 
 on:
   workflow_dispatch:
+    # <--- PERUBAHAN 1: Tambahkan 'inputs' ---
+    # Ini akan membuat kotak teks saat Anda menekan 'Run workflow'
+    inputs:
+      archive_identifier:
+        description: 'Nama item unik di Archive.org (cth: windows-11-24h2-beta)'
+        required: true
+        default: 'windows-11-generic-build' # Default jika Anda lupa mengisi
 
 jobs:
   build:
@@ -10,6 +17,8 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+
+      # ... (Langkah Download UUP dan Convert to ISO tetap sama) ...
 
       - name: Download UUP files
         run: |
@@ -26,25 +35,48 @@ jobs:
           path: "*.iso"
 
       - name: Generate build metadata
+        id: metadata 
         shell: pwsh
         run: |
           $iso = Get-ChildItem -Filter *.iso | Select-Object -First 1
+          if (-not $iso) {
+            Write-Error "File ISO tidak ditemukan!"
+            exit 1
+          }
           $hash = Get-FileHash $iso.FullName -Algorithm SHA256
           $buildDate = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
+          
+          # <--- PERUBAHAN 2: Tambahkan input ke file metadata ---
           $content = @"
           File Name: $($iso.Name)
           SHA256: $($hash.Hash)
           Build Date (UTC): $buildDate
           Repository: $env:GITHUB_REPOSITORY
           Run ID: $env:GITHUB_RUN_ID
+          Archive Identifier: ${{ github.event.inputs.archive_identifier }}
           "@
           $content | Out-File -Encoding utf8 build-info.txt
 
-      - name: Upload metadata to Archive.org
+          echo "iso_name=$($iso.Name)" >> $env:GITHUB_OUTPUT
+          
+      - name: Upload metadata and ISO to Archive.org
         env:
           ARCHIVE_USERNAME: ${{ secrets.ARCHIVE_USERNAME }}
           ARCHIVE_SECRET: ${{ secrets.ARCHIVE_SECRET }}
+          ISO_NAME: ${{ steps.metadata.outputs.iso_name }} 
+          # <--- PERUBAHAN 3: Ambil 'identifier' dari input workflow ---
+          ARCHIVE_IDENTIFIER: ${{ github.event.inputs.archive_identifier }}
+        shell: pwsh
         run: |
-          curl -X PUT -u "%ARCHIVE_USERNAME%:%ARCHIVE_SECRET%" ^
-            -T "build-info.txt" ^
-            "https://s3.us.archive.org/windows-build-${{ github.run_id }}/build-info.txt"
+          $auth = "${env:ARCHIVE_USERNAME}:${env:ARCHIVE_SECRET}"
+          
+          # <--- PERUBAHAN 4: Bangun baseUrl secara dinamis ---
+          $baseUrl = "https://s3.us.archive.org/${env:ARCHIVE_IDENTIFIER}"
+
+          Write-Host "Mengunggah ke item Archive.org: ${env:ARCHIVE_IDENTIFIER}"
+
+          Write-Host "Mengunggah build-info.txt..."
+          curl -X PUT -u $auth -T "build-info.txt" "$baseUrl/build-info.txt"
+
+          Write-Host "Mengunggah ${{ env.ISO_NAME }}..."
+          curl -X PUT -u $auth -T "${{ env.ISO_NAME }}" "$baseUrl/${{ env.ISO_NAME }}"
