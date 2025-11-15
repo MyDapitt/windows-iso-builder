@@ -1,62 +1,128 @@
-name: Download ISO and Upload to Archive.org
+name: Build BlissOS (Voyager-x86)
 
 on:
   workflow_dispatch:
-    # 1. Workflow ini akan meminta 3 input saat Anda menjalankannya
     inputs:
-      iso_url:
-        description: 'URL download (direct) file ISO'
-        required: true
-      iso_filename:
-        description: 'Nama file untuk ISO (cth: windows-11-24h2.iso)'
-        required: true
-        default: 'downloaded.iso'
-      archive_identifier:
-        description: 'Nama item unik di Archive.org (cth: my-iso-collection)'
-        required: true
+      build_variant:
+        description: "BLISS_BUILD_VARIANT (vanilla/gapps/foss/microg)"
+        required: false
+        default: "vanilla"
+      special_variant:
+        description: "BLISS_SPECIAL_VARIANT (misal: -jupiter / -surface)"
+        required: false
+        default: ""
 
 jobs:
-  download-and-upload:
-    runs-on: windows-latest # Bisa juga ubuntu-latest untuk menghemat waktu
+  build:
+    runs-on: ubuntu-22.04
+    env:
+      BLISS_BUILD_VARIANT: ${{ github.event.inputs.build_variant }}
+      BLISS_SPECIAL_VARIANT: ${{ github.event.inputs.special_variant }}
 
     steps:
-      - name: Download ISO file
-        shell: pwsh # Menggunakan PowerShell
-        run: |
-          $url = "${{ github.event.inputs.iso_url }}"
-          $file = "${{ github.event.inputs.iso_filename }}"
-          
-          Write-Host "Mulai mengunduh file '$file' dari '$url'..."
-          
-          # 2. Perintah untuk mengunduh file
-          # Ini adalah perintah PowerShell asli untuk download file
-          Invoke-WebRequest -Uri $url -OutFile $file -Verbose
-          
-          Write-Host "Download selesai."
+    - name: Checkout Repo
+      uses: actions/checkout@v4
 
-      - name: Upload ISO to Archive.org
-        env:
-          # 3. Membutuhkan secret yang sama seperti sebelumnya
-          ARCHIVE_USERNAME: ${{ secrets.ARCHIVE_USERNAME }}
-          ARCHIVE_SECRET: ${{ secrets.ARCHIVE_SECRET }}
-          
-          # 4. Ambil nama file dan identifier dari input
-          ISO_NAME: ${{ github.event.inputs.iso_filename }} 
-          ARCHIVE_IDENTIFIER: ${{ github.event.inputs.archive_identifier }}
-        shell: pwsh
-        run: |
-          # 5. Cek apakah file hasil download ada
-          if (-not (Test-Path $env:ISO_NAME)) {
-            Write-Error "File ISO '${env:ISO_NAME}' tidak ditemukan. Pastikan URL download benar."
-            exit 1
-          }
+    - name: Install AOSP/BlissOS dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y \
+          git-core gnupg flex bison gperf build-essential zip curl \
+          zlib1g-dev gcc-multilib g++-multilib libc6-dev-i386 \
+          lib32ncurses5-dev x11proto-core-dev libx11-dev lib32z-dev \
+          ccache libgl1-mesa-dev libxml2-utils xsltproc unzip \
+          squashfs-tools python3-mako libssl-dev ninja-build lunzip \
+          syslinux syslinux-utils gettext genisoimage gettext \
+          bc xorriso xmlstarlet meson glslang-tools git-lfs \
+          libncurses5 libncurses5:i386 libelf-dev aapt zstd rdfind \
+          nasm kmod
+        sudo apt remove rustc bindgen cargo -y || true
 
-          $auth = "${env:ARCHIVE_USERNAME}:${env:ARCHIVE_SECRET}"
-          $baseUrl = "https://s3.us.archive.org/${env:ARCHIVE_IDENTIFIER}"
+    - name: Install Rust toolchain
+      run: |
+        curl https://sh.rustup.rs -sSf | sh -s -- -y
+        source $HOME/.cargo/env
+        rustup target add x86_64-linux-android i686-linux-android
+        cargo install cargo-ndk
+        cargo install --version 0.69.1 bindgen-cli
+        cargo install cbindgen
 
-          Write-Host "Mengunggah ${{ env.ISO_NAME }} ke item: ${env:ARCHIVE_IDENTIFIER}"
-          
-          # 6. Perintah upload menggunakan curl
-          curl -X PUT -u $auth -T "${{ env.ISO_NAME }}" "$baseUrl/${{ env.ISO_NAME }}"
-          
-          Write-Host "Upload selesai."
+    - name: Install repo tool
+      run: |
+        mkdir -p ~/bin
+        curl https://storage.googleapis.com/git-repo-downloads/repo > ~/bin/repo
+        chmod a+x ~/bin/repo
+        echo "export PATH=~/bin:$PATH" >> $GITHUB_ENV
+
+    - name: Initialize BlissOS repo
+      run: |
+        mkdir ~/bliss
+        cd ~/bliss
+        ~/bin/repo init -u https://github.com/BlissOS/platform_manifest.git -b voyager-x86 --git-lfs
+
+    - name: Sync repo (this will take long)
+      run: |
+        cd ~/bliss
+        ~/bin/repo sync -c --force-sync --no-tags --no-clone-bundle \
+          -j$(nproc --all) --optimized-fetch --prune
+
+    - name: Cleanup & Expand Disk
+      run: |
+        sudo apt-get purge -y azure-cli google-cloud-sdk dotnet* php* mono-runtime mongodb* || true
+        sudo apt-get autoremove -y || true
+        sudo apt-get clean
+
+        sudo rsync -a $HOME /mnt/
+        sudo rm -rf $HOME
+        sudo ln -s /mnt/runner $HOME
+
+    - name: Build BlissOS ISO
+      run: |
+        cd ~/bliss
+        source build/envsetup.sh
+        
+        echo ">> Using BLISS_BUILD_VARIANT=${BLISS_BUILD_VARIANT}"
+        echo ">> Using BLISS_SPECIAL_VARIANT=${BLISS_SPECIAL_VARIANT}"
+        
+        export BLISS_BUILD_VARIANT=${BLISS_BUILD_VARIANT}
+        export BLISS_SPECIAL_VARIANT=${BLISS_SPECIAL_VARIANT}
+        
+        lunch bliss_x86_64-ap4a-userdebug
+        make iso_img -j$(nproc)
+
+    - name: Upload BlissOS ISO Artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: BlissOS-ISO
+        path: ~/bliss/out/target/product/*/*.iso
+        if-no-files-found: warn
+
+    - name: Create GitHub Release (if not exists)
+      id: create_release
+      run: |
+        TAG_NAME="v1.0-${{ github.run_number }}"
+        BODY="BlissOS Build - ${TAG_NAME}"
+
+        # Check if the release exists
+        RESPONSE=$(curl -s \
+          -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+          -H "Accept: application/vnd.github.v3+json" \
+          "https://api.github.com/repos/${{ github.repository }}/releases/tags/${TAG_NAME}")
+
+        # Create release if it doesn't exist
+        if [[ "$(echo $RESPONSE | jq -r .message)" == "Not Found" ]]; then
+          echo "Release does not exist. Creating a new one."
+          curl -s \
+            -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+            -X POST \
+            -d "{\"tag_name\": \"${TAG_NAME}\", \"name\": \"${TAG_NAME}\", \"body\": \"${BODY}\", \"draft\": false, \"prerelease\": false}" \
+            "https://api.github.com/repos/${{ github.repository }}/releases"
+        else
+          echo "Release already exists."
+        fi
+
+    - name: Upload ISO to GitHub Release
+      uses: ncipollo/release-action@v1
+      with:
+        artifacts: ~/bliss/out/target/product/*/*.iso
+        tag: "v1.0-${{ github.run_number }}"
