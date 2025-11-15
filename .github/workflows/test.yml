@@ -14,7 +14,7 @@ on:
 
 jobs:
   build:
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-20.04
     env:
       BLISS_BUILD_VARIANT: ${{ github.event.inputs.build_variant }}
       BLISS_SPECIAL_VARIANT: ${{ github.event.inputs.special_variant }}
@@ -25,6 +25,7 @@ jobs:
 
     - name: Install AOSP/BlissOS dependencies
       run: |
+       sudo dpkg --add-architecture i386 
         sudo apt-get update
         sudo apt-get install -y \
           git-core gnupg flex bison gperf build-essential zip curl \
