@@ -1,12 +1,13 @@
-name: Build Windows ISO (Windows Runner) and Upload Metadata
+name: Build Windows ISO (Windows Runner) and Upload to Release
 
 on:
   workflow_dispatch:
     inputs:
+      # Kita tetap simpan input ini karena Anda menambahkannya ke build-info.txt
       archive_identifier:
-        description: 'Nama item unik di Archive.org (cth: windows-11-24h2-beta)'
+        description: 'Nama item unik (cth: windows-11-24h2-beta)'
         required: true
-        default: 'windows-11-generic-build' 
+        default: 'windows-11-generic-build'
 
 jobs:
   build:
@@ -16,12 +17,11 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # --- PERUBAHAN DI SINI ---
       - name: Download UUP files and Convert to ISO
         shell: cmd
+        # Skrip ini (sesuai permintaan Anda) diasumsikan
+        # menangani download dan konversi
         run: .\uup_download_windows.cmd
-
-      # --- AKHIR PERUBAHAN ---
 
       - name: Upload ISO as private artifact
         uses: actions/upload-artifact@v4
@@ -30,7 +30,7 @@ jobs:
           path: "*.iso"
 
       - name: Generate build metadata
-        id: metadata 
+        id: metadata
         shell: pwsh
         run: |
           $iso = Get-ChildItem -Filter *.iso | Select-Object -First 1
@@ -40,33 +40,48 @@ jobs:
           }
           $hash = Get-FileHash $iso.FullName -Algorithm SHA256
           $buildDate = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
+          
+          # 1. Membuat nama tag yang unik untuk Rilis (Release)
+          $tagName = "build-${{ github.run_id }}-${{ github.run_number }}"
+          
+          # 2. Menyimpan nama ISO dan nama Tag untuk langkah selanjutnya
+          echo "iso_name=$($iso.Name)" >> $env:GITHUB_OUTPUT
+          echo "release_tag=$tagName" >> $env:GITHUB_OUTPUT
+
           $content = @"
           File Name: $($iso.Name)
           SHA256: $($hash.Hash)
           Build Date (UTC): $buildDate
+          Release Tag: $tagName
           Repository: $env:GITHUB_REPOSITORY
           Run ID: $env:GITHUB_RUN_ID
-          Archive Identifier: ${{ github.event.inputs.archive_identifier }}
+          Identifier (from input): ${{ github.event.inputs.archive_identifier }}
           "@
           $content | Out-File -Encoding utf8 build-info.txt
 
-          echo "iso_name=$($iso.Name)" >> $env:GITHUB_OUTPUT
-          
-      - name: Upload metadata and ISO to Archive.org
+      # --- LANGKAH UPLOAD ARCHIVE.ORG DIHAPUS ---
+
+      # --- LANGKAH BARU UNTUK GITHUB RELEASE ---
+      - name: Create GitHub Release and Upload Assets
+        uses: softprops/action-gh-release@v2
         env:
-          ARCHIVE_USERNAME: ${{ secrets.ARCHIVE_USERNAME }}
-          ARCHIVE_SECRET: ${{ secrets.ARCHIVE_SECRET }}
-          ISO_NAME: ${{ steps.metadata.outputs.iso_name }} 
-          ARCHIVE_IDENTIFIER: ${{ github.event.inputs.archive_identifier }}
-        shell: pwsh
-        run: |
-          $auth = "${env:ARCHIVE_USERNAME}:${env:ARCHIVE_SECRET}"
-          $baseUrl = "https://s3.us.archive.org/${env:ARCHIVE_IDENTIFIER}"
-
-          Write-Host "Mengunggah ke item Archive.org: ${env:ARCHIVE_IDENTIFIER}"
-
-          Write-Host "Mengunggah build-info.txt..."
-          curl -X PUT -u $auth -T "build-info.txt" "$baseUrl/build-info.txt"
-
-          Write-Host "Mengunggah ${{ env.ISO_NAME }}..."
-          curl -X PUT -u $auth -T "${{ env.ISO_NAME }}" "$baseUrl/${{ env.ISO_NAME }}"
+          # Token ini diperlukan untuk membuat rilis.
+          # Ini disediakan secara otomatis oleh GitHub.
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          # Nama Rilis, contoh: "Windows Build 123"
+          name: "Windows Build ${{ github.run_number }}"
+          
+          # Nama Tag, kita ambil dari output langkah metadata
+          tag_name: ${{ steps.metadata.outputs.release_tag }}
+          
+          # Gunakan file build-info.txt sebagai deskripsi Rilis
+          body_path: "build-info.txt"
+          
+          # Tandai ini sebagai "pre-release" (disarankan)
+          prerelease: true 
+          
+          # Daftar file yang akan diunggah
+          files: |
+            ${{ steps.metadata.outputs.iso_name }}
+            build-info.txt
